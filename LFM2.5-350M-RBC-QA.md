@@ -15,8 +15,8 @@ All five. The iOS banking POC runs entirely on-device via Metal GPU acceleration
 | **Classification** (intent, fraud, dispute, compliance, transaction)              | 14 classifier heads firing simultaneously from one backbone forward pass                                 | ~40ms total for all 14 classifications                     | 8 trained heads pass accuracy gates (89.2%–99.5%). DecisionVector emits typed signals for intent routing, fraud risk level, dispute triage, compliance flags, transaction category, and query intent — all from a single ~35ms forward pass.                                                                                                                                            |
 | **Extraction** (PII detection — SSN, credit cards, account numbers, phone, email) | Token-level BIO classifier head                                                                          | ~85ms (embedding extraction + per-token classification)    | 95.3% sidecar accuracy, 92.4% true negative rate. 7 entity types. Tested with synthetic PII.                                                                                                                                                                                                                                                                                            |
 | **Summarization**                                                                 | Generative decoding (autoregressive)                                                                     | ~700ms for 64-token output                                 | Supported but not the primary use case at 350M scale. Banking queries are better served by classification + template responses.                                                                                                                                                                                                                                                         |
-| **Tool use / function calling**                                                   | Generative decoding with native LFM2 tool format (`<\|tool_call_start\|>[fn(k="v")]<\|tool_call_end\|>`) | ~700ms for 64-token generation                             | Production-proven in the audio cockpit (v6 deployed). Banking POC routes tool calls through DecisionRouter after classifier-head intent detection.                                                                                                                                                                                                                                      |
-| **RAG (retrieval-augmented generation)**                                          | Classifier-based KB retrieval + grounded generative answer                                               | ~750ms end-to-end (retrieval <1ms + generation ~700ms)     | Proven in a separate enterprise support POC with a 32-entry knowledge base. Three retrieval strategies implemented and evaluated: keyword matching (<1ms), LoRA-memorized 32-class classifier (~35ms), and embedding cosine retrieval (~30µs/entry). Grounded QA generation uses retrieved KB article as context — model answers only from the reference, cannot hallucinate beyond it. |
+| **Tool use / function calling**                                                   | Generative decoding with native LFM2 tool format (`<\|tool_call_start\|>[fn(k="v")]<\|tool_call_end\|>`) | ~700ms for 64-token generation                             | Banking POC routes tool calls through DecisionRouter after classifier-head intent detection.                                                                                                                                                                                                                                      |
+| **RAG (retrieval-augmented generation)**                                          | Classifier-based KB retrieval + grounded generative answer                                               | ~750ms end-to-end (retrieval <1ms + generation ~700ms)     |  LoRA-memorized 32-class classifier (~35ms), and embedding cosine retrieval (~30µs/entry). Grounded QA generation uses retrieved KB article as context — model answers only from the reference, cannot hallucinate beyond it. |
 | **Offline chat**                                                                  | Fully local inference, no network dependency                                                             | Same latencies as online — inference is entirely on-device | The model, all LoRA adapters, and all classifier heads are bundled locally. Performance is identical whether the device has network connectivity or not.                                                                                                                                                                                                                                |
 
 ### How much does performance change when the prompt is shortened, context is truncated, or the device is offline?
@@ -65,7 +65,7 @@ _Extrapolated from measured KV growth rate. Base memory without KV cache is ~110
 
 ### Does the model support quantization-aware training (QAT) checkpoints, or only post-training quantization (PTQ)? What quality recovery mechanism is used at 4-bit and 2-bit?
 
-**Current approach: Post-training quantization (PTQ)** via the GGUF format ecosystem. The LFM2 technical report (arxiv 2511.23404) documents Q4_0 quantization for llama.cpp and 8da4w (8-bit dynamic activations, 4-bit weights) for ExecuTorch. QAT checkpoints are not currently published.
+**Current approach: Post-training quantization (PTQ)** via the GGUF format ecosystem. QAT checkpoints are under research.
 
 **Available quantization tiers:**
 
@@ -81,7 +81,6 @@ _Extrapolated from measured KV growth rate. Base memory without KV cache is ~110
 
 **At 2-bit (Q2_K):** Quality drops ~10–15% on structured extraction tasks. Not recommended for production banking use cases. The format is available in the GGUF ecosystem but has not been validated for the banking classifier pipeline.
 
-**QAT path (available but not yet exercised):** The LEAP fine-tuning infrastructure supports training at reduced precision. If RBC requires QAT checkpoints for specific quality recovery guarantees, this is an engineering exercise — not an architectural limitation.
 
 ### Does the model architecture support stateful or stateless inference? How is session state (KV cache) managed across app backgrounding and OS memory pressure events on iOS?
 
@@ -136,7 +135,7 @@ _Extrapolated from measured KV growth rate. Base memory without KV cache is ~110
 
 **Safety alignment:** The published report includes refusal filtering in the SFT data pipeline. Formal red-teaming results, safety benchmarks, and constitutional AI procedures are not detailed in the public report. For the banking use case, safety is addressed at the application layer: the 350M models are task-specific classifiers/extractors (not general-purpose chatbots), constrained output formats enforce JSON schema compliance, and the multi-layer pipeline (PII filter → intent router → specialist → egress guard) provides defense in depth.
 
-**RLHF/RLVF:** Not used. The preference alignment uses DPO-family optimization (specifically, a length-normalized generalized DPO variant), not reinforcement learning from human feedback.
+**RLHF/RLVF:** The preference alignment uses DPO-family optimization (specifically, a length-normalized generalized DPO variant), not reinforcement learning from human feedback.
 
 **LFM2.5 specifically:** LFM2.5 builds on the LFM2 base with 2.8x more pretraining data (28T vs 10T tokens) and additional RL. The same post-training methodology applies.
 
@@ -267,6 +266,13 @@ Cloud fallback requires explicit per-session consent via `ConsentManager` (state
 | Model usage statistics | **No**                                                      | Tracked locally via `PrivacyTracker` for on-screen display only. Metrics (totalQueries, edgeOnlyQueries, cloudQueries, piiDetected) are in-memory and not persisted or transmitted. |
 | Model update checks    | **Only when user explicitly requests model pack downloads** | `ModelManager` fetches from CDN only on explicit user action. No background polling.                                                                                                |
 | Input/output logs      | **No**                                                      | Never persisted beyond the current app session                                                                                                                                      |
+
+
+
+
+
+
+
 
 **Data flow:**
 
@@ -403,7 +409,7 @@ Cloud fallback requires explicit per-session consent via `ConsentManager` (state
 | **Full fine-tune**          | Yes                              | 1,000+ examples  | Available but LoRA preferred for mobile deployment (smaller delta weights, OTA-updatable).                                                                                                                                          |
 | **QLoRA**                   | Not yet tested                   | —                | Standard LoRA on F16 base, then quantize to GGUF post-training achieves the same end result. QLoRA would reduce training VRAM but is not yet validated on LFM2.5.                                                                   |
 | **DPO**                     | Used in base model post-training | —                | The base LFM2.5 model uses a length-normalized DPO variant for preference alignment. Not typically needed for narrow task fine-tuning at 350M scale — task-specific SFT outperforms alignment tuning for classification/extraction. |
-| **RLHF**                    | Not used                         | —                | The base model uses DPO-family alignment, not RLHF. For task-specific fine-tuning at 350M scale, SFT is sufficient.                                                                                                                 |
+| **RLHF**                    | Not used                         | —                | The base model uses DPO-family alignment. For task-specific fine-tuning at 350M scale, SFT is sufficient.                                                                                                                 |
 | **RLVF**                    | Not applicable                   | —                | Not used in the current training pipeline.                                                                                                                                                                                          |
 
 **Practical guidance on dataset size for banking tasks:**
@@ -422,7 +428,7 @@ Cloud fallback requires explicit per-session consent via `ConsentManager` (state
 - **Base model:** Licensed from Liquid AI. The base LFM2.5-350M weights are Liquid's IP.
 - **LoRA adapters (fine-tune delta weights):** Customer property. These are the trained parameter deltas produced by fine-tuning on customer data.
 - **Classifier heads:** Customer property. These are the linear projection weights trained on customer-labeled data.
-- **Training data:** Customer property. Training data is never transmitted to Liquid AI during LEAP fine-tuning (training runs on customer-controlled infrastructure).
+- **Training data:** If provided by Customer, Customer property. 
 - **Inference outputs:** Customer property. No output logging, no telemetry, no data retention by Liquid.
 
 ---
@@ -595,43 +601,6 @@ This is a POC, not a GA product or App Store listing. It demonstrates the archit
 ### Has on-device RAG been proven? How does retrieval work without a vector database or cloud search backend?
 
 **Yes — on-device RAG has been proven in a separate enterprise support POC** using LFM2.5-350M on iPhone. The architecture retrieves from a curated knowledge base entirely on-device, then generates a grounded answer using the retrieved article as context. No cloud search, no vector database, no network dependency.
-
-**Three retrieval strategies were implemented and evaluated:**
-
-| Strategy                                   | How It Works                                                                                                                        | Latency                                      | Accuracy                                             | Best For                                                           |
-| ------------------------------------------ | ----------------------------------------------------------------------------------------------------------------------------------- | -------------------------------------------- | ---------------------------------------------------- | ------------------------------------------------------------------ |
-| **Keyword matching** (production)          | Token-overlap scoring against curated KB entry aliases. Deterministic, sub-millisecond.                                             | <1ms                                         | 100% on alias-matched queries                        | Small-to-medium KBs (≤150 entries) with well-curated topic aliases |
-| **LoRA memorization** (validated)          | Fine-tuned LoRA adapter that encodes the entire KB into weights. Query-only prompt (~40 tokens) → model outputs entry_id + passage. | ~35ms                                        | 83.8% on canonical fixture, 100% off-topic precision | Static KBs where update cadence is low (retrain = minutes)         |
-| **Embedding cosine retrieval** (validated) | LFM2.5 backbone extracts 1024-dim embeddings via last-token pooling. Cosine similarity search over pre-computed KB vectors.         | ~30µs per entry + ~35ms embedding extraction | Threshold-tunable                                    | Larger KBs (100+ entries), dynamic content, multi-tenant           |
-
-**Grounded QA generation (retrieve → augment → generate):**
-
-Once retrieval selects a KB entry, the generative path produces a natural-language answer grounded in the retrieved reference:
-
-1. **Retrieve:** KB extractor returns a `KBCitation` with entry ID, passage, confidence score, and retrieval latency
-2. **Augment:** Retrieved KB article injected as reference context in the generation prompt — the model is instructed to answer only from the reference, preventing hallucination
-3. **Generate:** LFM2.5-350M produces a 2–3 sentence answer (~700ms for 64 tokens) that synthesizes the retrieved content into a natural response
-
-**End-to-end RAG latency:** <750ms (retrieval <1ms + generation ~700ms). Fully on-device, fully offline.
-
-**Architecture decisions and scaling:**
-
-| KB Size        | Recommended Strategy                     | Why                                                                                 |
-| -------------- | ---------------------------------------- | ----------------------------------------------------------------------------------- |
-| ≤50 entries    | Keyword matching                         | Perfect accuracy on curated aliases, zero model inference, trivially debuggable     |
-| 50–150 entries | LoRA memorization or embedding retrieval | LoRA if update cadence is low; embeddings if KB changes frequently                  |
-| 150+ entries   | Embedding retrieval                      | LoRA memorization hits a ceiling; cosine retrieval scales linearly with entry count |
-| 1,000+ entries | Embedding retrieval + re-ranking         | Add a lightweight re-ranking head on retrieved candidates                           |
-
-**Embedding index infrastructure (built and validated):**
-
-The on-device embedding index uses a three-tier load strategy for instant availability:
-
-1. **Bundled binary** (0ms warmup) — pre-computed embeddings shipped in app bundle
-2. **On-device cache** (~50ms) — cached after first computation, invalidated on KB or model version change
-3. **On-device compute** (~5s for 34 entries) — LFM2.5 forward pass per entry, cached for subsequent launches
-
-Vectors are L2-normalized (cosine similarity = dot product), stored as float32, keyed by SHA256 of model version + KB content hash for cache invalidation.
 
 **Relevance to RBC banking:**
 
